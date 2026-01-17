@@ -95,8 +95,13 @@ func (p *Page) InsertRecord(record []byte) (uint16, error) {
 	dataAreaStart := uint16(PageSize)
 
 	for i := uint16(0); i < p.header.SlotCount; i++ {
+		length := p.getSlotLength(i)
+		if length == 0 {
+			continue
+		}
+
 		offset := p.getSlotOffset(i)
-		if offset < dataAreaStart {
+		if offset > 0 && offset < dataAreaStart {
 			dataAreaStart = offset
 		}
 	}
@@ -106,6 +111,11 @@ func (p *Page) InsertRecord(record []byte) (uint16, error) {
 	}
 
 	newOffset := dataAreaStart - recordLen
+
+	if newOffset < uint16(slotAreaEnd) || newOffset+recordLen > PageSize {
+		return 0, errors.New("invalid offset calculation")
+	}
+
 	copy(p.data[newOffset:newOffset+recordLen], record)
 
 	slotID := p.header.SlotCount

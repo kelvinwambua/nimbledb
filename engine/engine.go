@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -29,13 +32,180 @@ type TableMetadata struct {
 	UniqueKeys [][]string
 }
 
+type persistedTableMetadata struct {
+	Name       string           `json:"name"`
+	Columns    []columnMetadata `json:"columns"`
+	PrimaryKey []string         `json:"primary_key"`
+	UniqueKeys [][]string       `json:"unique_keys"`
+}
+
+type columnMetadata struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	MaxLen    uint16 `json:"max_len"`
+	NotNull   bool   `json:"not_null"`
+	IsPrimary bool   `json:"is_primary"`
+	IsUnique  bool   `json:"is_unique"`
+}
+
 func NewEngine(dataDir string) *Engine {
-	return &Engine{
+	e := &Engine{
 		tables:  make(map[string]*TableMetadata),
 		indexes: make(map[string]*index.Index),
 		pagers:  make(map[string]*storage.Pager),
 		dataDir: dataDir,
 	}
+
+	if err := e.loadMetadata(); err != nil {
+		fmt.Printf("Warning: failed to load metadata: %v\n", err)
+	}
+
+	return e
+}
+
+func (e *Engine) loadMetadata() error {
+	metadataPath := filepath.Join(e.dataDir, "metadata.json")
+
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var tables []persistedTableMetadata
+	if err := json.Unmarshal(data, &tables); err != nil {
+		return err
+	}
+
+	for _, tableMeta := range tables {
+		columns := make([]storage.Column, len(tableMeta.Columns))
+		for i, col := range tableMeta.Columns {
+			var dataType storage.DataType
+			switch col.Type {
+			case "INT":
+				dataType = storage.TypeInt
+			case "VARCHAR":
+				dataType = storage.TypeVarchar
+			case "BOOL":
+				dataType = storage.TypeBool
+			case "FLOAT":
+				dataType = storage.TypeFloat
+			case "DATE":
+				dataType = storage.TypeDate
+			}
+
+			columns[i] = storage.Column{
+				Name:      col.Name,
+				Type:      dataType,
+				MaxLen:    col.MaxLen,
+				NotNull:   col.NotNull,
+				IsPrimary: col.IsPrimary,
+				IsUnique:  col.IsUnique,
+			}
+		}
+
+		pager, err := storage.NewPager(filepath.Join(e.dataDir, tableMeta.Name+".db"))
+		if err != nil {
+			return err
+		}
+
+		var rootPageID uint32 = 1
+		table := &storage.Table{}
+		*table = storage.Table{
+			Name:       tableMeta.Name,
+			Columns:    columns,
+			Pager:      pager,
+			RootPageID: rootPageID,
+		}
+
+		metadata := &TableMetadata{
+			Name:       tableMeta.Name,
+			Columns:    columns,
+			Table:      table,
+			Indexes:    make([]*index.Index, 0),
+			PrimaryKey: tableMeta.PrimaryKey,
+			UniqueKeys: tableMeta.UniqueKeys,
+		}
+
+		if len(tableMeta.PrimaryKey) > 0 {
+			idx := index.NewIndex(
+				tableMeta.Name+"_pk",
+				tableMeta.Name,
+				tableMeta.PrimaryKey,
+				true,
+				true,
+			)
+			metadata.Indexes = append(metadata.Indexes, idx)
+			e.indexes[tableMeta.Name+"_pk"] = idx
+		}
+
+		for _, uniqueKey := range tableMeta.UniqueKeys {
+			idx := index.NewIndex(
+				tableMeta.Name+"_uk_"+uniqueKey[0],
+				tableMeta.Name,
+				uniqueKey,
+				true,
+				false,
+			)
+			metadata.Indexes = append(metadata.Indexes, idx)
+			e.indexes[tableMeta.Name+"_uk_"+uniqueKey[0]] = idx
+		}
+
+		e.tables[tableMeta.Name] = metadata
+		e.pagers[tableMeta.Name] = pager
+	}
+
+	return nil
+}
+
+func (e *Engine) saveMetadata() error {
+	metadataPath := filepath.Join(e.dataDir, "metadata.json")
+
+	tables := make([]persistedTableMetadata, 0, len(e.tables))
+
+	for _, meta := range e.tables {
+		columns := make([]columnMetadata, len(meta.Columns))
+		for i, col := range meta.Columns {
+			var typeStr string
+			switch col.Type {
+			case storage.TypeInt:
+				typeStr = "INT"
+			case storage.TypeVarchar:
+				typeStr = "VARCHAR"
+			case storage.TypeBool:
+				typeStr = "BOOL"
+			case storage.TypeFloat:
+				typeStr = "FLOAT"
+			case storage.TypeDate:
+				typeStr = "DATE"
+			}
+
+			columns[i] = columnMetadata{
+				Name:      col.Name,
+				Type:      typeStr,
+				MaxLen:    col.MaxLen,
+				NotNull:   col.NotNull,
+				IsPrimary: col.IsPrimary,
+				IsUnique:  col.IsUnique,
+			}
+		}
+
+		tables = append(tables, persistedTableMetadata{
+			Name:       meta.Name,
+			Columns:    columns,
+			PrimaryKey: meta.PrimaryKey,
+			UniqueKeys: meta.UniqueKeys,
+		})
+	}
+
+	data, err := json.MarshalIndent(tables, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(metadataPath, data, 0644)
 }
 
 func (e *Engine) Execute(stmt query.Statement) ([]string, [][]interface{}, error) {
@@ -98,7 +268,7 @@ func (e *Engine) executeCreateTable(stmt *query.CreateTableStmt) ([]string, [][]
 		}
 	}
 
-	pager, err := storage.NewPager(e.dataDir + "/" + stmt.TableName + ".db")
+	pager, err := storage.NewPager(filepath.Join(e.dataDir, stmt.TableName+".db"))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -164,6 +334,10 @@ func (e *Engine) executeCreateTable(stmt *query.CreateTableStmt) ([]string, [][]
 	e.tables[stmt.TableName] = metadata
 	e.pagers[stmt.TableName] = pager
 
+	if err := e.saveMetadata(); err != nil {
+		return nil, nil, err
+	}
+
 	return []string{"message"}, [][]interface{}{{"Table created successfully"}}, nil
 }
 
@@ -181,6 +355,10 @@ func (e *Engine) executeDropTable(stmt *query.DropTableStmt) ([]string, [][]inte
 
 	delete(e.tables, stmt.TableName)
 	delete(e.pagers, stmt.TableName)
+
+	if err := e.saveMetadata(); err != nil {
+		return nil, nil, err
+	}
 
 	return []string{"message"}, [][]interface{}{{"Table dropped successfully"}}, nil
 }
@@ -236,13 +414,11 @@ func (e *Engine) executeInsert(stmt *query.InsertStmt) ([]string, [][]interface{
 			}
 		}
 
-		// FIRST: Check unique constraints BEFORE inserting
 		for _, idx := range metadata.Indexes {
 			if len(idx.Columns) == 1 {
 				colIdx := e.findColumnIndex(metadata.Columns, idx.Columns[0])
 				if colIdx >= 0 {
 					keyValue, _ := tuple.GetValue(colIdx)
-					// Check if key already exists
 					if _, found := idx.Search(keyValue); found {
 						return nil, nil, fmt.Errorf("constraint violation: unique constraint violation")
 					}
@@ -250,13 +426,11 @@ func (e *Engine) executeInsert(stmt *query.InsertStmt) ([]string, [][]interface{
 			}
 		}
 
-		// SECOND: Insert into table and get the actual location
 		pageID, slotID, err := metadata.Table.Insert(tuple)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		// THIRD: Insert into indexes with the correct location
 		for _, idx := range metadata.Indexes {
 			if len(idx.Columns) == 1 {
 				colIdx := e.findColumnIndex(metadata.Columns, idx.Columns[0])
@@ -288,9 +462,7 @@ func (e *Engine) executeSelect(stmt *query.SelectStmt) ([]string, [][]interface{
 	if stmt.Where != nil && len(stmt.Joins) == 0 {
 		filter = func(tuple *storage.Tuple) bool {
 			result, err := e.evaluateExprWithTable(stmt.Where, tuple, metadata)
-			fmt.Printf("DEBUG: Filter called, result=%v, err=%v\n", result, err)
 			if err != nil {
-				fmt.Printf("DEBUG: Error details: %v\n", err)
 				return false
 			}
 			if b, ok := result.(bool); ok {
@@ -726,7 +898,6 @@ func (e *Engine) compareValues(left, right interface{}) int {
 			}
 			return 0
 		}
-		// Handle int64 vs float64
 		if r, ok := right.(float64); ok {
 			lf := float64(l)
 			if lf < r {
@@ -756,7 +927,6 @@ func (e *Engine) compareValues(left, right interface{}) int {
 			}
 			return 0
 		}
-		// Handle float64 vs int64
 		if r, ok := right.(int64); ok {
 			rf := float64(r)
 			if l < rf {
